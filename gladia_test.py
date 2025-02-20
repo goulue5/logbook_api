@@ -4,6 +4,7 @@ import json
 import signal
 import sys
 import traceback
+import os  
 from datetime import time
 from typing import Literal, TypedDict
 
@@ -19,12 +20,15 @@ import wave
 import datetime
 
 from supabase import create_client, Client
+from dotenv import load_dotenv  
+
+load_dotenv()
 
 # --- Supabase configuration ---
-SUPABASE_URL = "https://myjauxextjrucjpkskky.supabase.co/"
-SUPABASE_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im15amF1eGV4dGpydWNqcGtza2t5Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTczOTc4NjY1NiwiZXhwIjoyMDU1MzYyNjU2fQ.YjWr3Zp3spPFo4PbRvzggo0zm0MNhXyB_NJepOuhhYY"
-SUPABASE_BUCKET_NAME = "logbook-audio-records"
-SUPABASE_TABLE_NAME = "recordings"
+SUPABASE_URL = os.getenv("SUPABASE_URL")  
+SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY")  
+SUPABASE_BUCKET_NAME = os.getenv("SUPABASE_BUCKET_NAME")  
+SUPABASE_TABLE_NAME = os.getenv("SUPABASE_TABLE_NAME")  
 
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_API_KEY)
 
@@ -51,7 +55,7 @@ class StreamingConfiguration(TypedDict):
 
 ## Helpers
 def get_gladia_key() -> str:
-    return "24e46562-4fb0-4b7c-aa73-70bbbf68330d"
+    return os.getenv("GLADIA_API_KEY")  
 
 def init_live_session(config: StreamingConfiguration) -> InitiateResponse:
     gladia_key = get_gladia_key()
