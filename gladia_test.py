@@ -3,6 +3,7 @@ import base64
 import json
 import signal
 import sys
+import traceback
 from datetime import time
 from typing import Literal, TypedDict
 
@@ -195,6 +196,7 @@ async def websocket_transcire(websocket: WebSocket):
     supabase_path = None
     upload_success = False
     db_insert_success = False
+    websocket_active = True
 
     try:
         await websocket.accept()
@@ -208,7 +210,8 @@ async def websocket_transcire(websocket: WebSocket):
                 raise ValueError("User ID not provided")
         except Exception as e:
             print(f"Erreur lors de la récupération de l'user_id: {e}")
-            await websocket.close()
+            if websocket_active:
+                await websocket.close()
             return
 
         response = init_live_session(STREAMING_CONFIGURATION)
@@ -218,73 +221,126 @@ async def websocket_transcire(websocket: WebSocket):
             send_audio_task = asyncio.create_task(send_audio(gladia_ws, audio_data))
             print_messages_task = asyncio.create_task(print_messages_from_socket(gladia_ws, websocket, transcription_list))
 
-            done, pending = await asyncio.wait(
-                [send_audio_task, print_messages_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            print("Tâches annulées.")
+            try:
+                done, pending = await asyncio.wait(
+                    [send_audio_task, print_messages_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                print("Tâches annulées.")
+            except WebSocketDisconnect:
+                websocket_active = False
+                print("Client disconnected during audio processing")
 
         print("Enregistrement terminé, uploading to Supabase Storage...")
         try:
             supabase_path = await upload_audio_to_supabase(audio_data)
             if supabase_path:
                 upload_success = True
-                # Passer l'user_id à save_transcription_to_database
                 db_insert_success = await save_transcription_to_database(supabase_path, transcription_list, user_id)
                 
                 if db_insert_success:
-                    try:
-                        await websocket.send_text("Audio et transcription enregistrés avec succès.")
-                    except RuntimeError:
-                        print("Websocket déjà fermé, impossible d'envoyer le message de succès")
+                    if websocket_active:
+                        try:
+                            await websocket.send_text(json.dumps({
+                                "status": "success",
+                                "message": "Audio et transcription enregistrés avec succès",
+                                "audio_url": supabase_client.storage.from_(SUPABASE_BUCKET_NAME).get_public_url(supabase_path),
+                                "transcription": transcription_list
+                            }))
+                        except RuntimeError:
+                            print("Websocket déjà fermé, impossible d'envoyer le message de succès")
+                            websocket_active = False
                 else:
-                    print("Échec de l'enregistrement dans la base de données")
+                    if websocket_active:
+                        try:
+                            await websocket.send_text(json.dumps({
+                                "status": "error",
+                                "message": "Échec de l'enregistrement dans la base de données"
+                            }))
+                        except RuntimeError:
+                            print("Websocket déjà fermé, impossible d'envoyer le message d'erreur")
+                            websocket_active = False
             else:
                 print("Échec de l'upload audio")
                 
         except Exception as e:
             print(f"Erreur lors du processus d'enregistrement: {e}")
+            if websocket_active:
+                try:
+                    await websocket.send_text(json.dumps({
+                        "status": "error",
+                        "message": "Erreur lors du processus d'enregistrement"
+                    }))
+                except RuntimeError:
+                    print("Websocket déjà fermé, impossible d'envoyer le message d'erreur")
 
     except WebSocketDisconnect:
         print("Client disconnected")
+        websocket_active = False
     except Exception as e:
         print(f"Erreur dans websocket_transcire: {e}")
+        if websocket_active:
+            try:
+                await websocket.send_text(json.dumps({
+                    "status": "error",
+                    "message": str(e)
+                }))
+            except RuntimeError:
+                print("Websocket déjà fermé, impossible d'envoyer le message d'erreur")
     finally:
         P.terminate()
-        try:
-            await websocket.close()
-        except RuntimeError:
-            pass
-
+        if websocket_active:
+            try:
+                await websocket.close()
+            except RuntimeError:
+                pass
+            
 async def save_transcription_to_database(supabase_path: str, transcription_list: list, user_id: str):
-    """Saves the transcription to the Supabase database."""
     try:
-        audio_url = supabase_client.storage.from_(SUPABASE_BUCKET_NAME).get_public_url(supabase_path)
+        if supabase_path.startswith('/'):
+            supabase_path = supabase_path[1:]
+
+        # Générer un lien signé au lieu d'un lien public
+        audio_url = supabase_client.storage.from_(SUPABASE_BUCKET_NAME).create_signed_url(
+            path=supabase_path,
+            expires_in=7 * 24 * 60 * 60  # URL valide pendant 7 jours
+        )
+        
+        print(f"URL signée générée avec succès: {audio_url}")
 
         data = {
-            "user_id": user_id,  # UUID de l'utilisateur
-            "audio_url": audio_url,
+            "user_id": user_id,
+            "audio_url": audio_url['signedURL'],  # Notez le changement ici pour accéder à l'URL signée
             "transcription_text": "\n".join(transcription_list),
             "created_at": datetime.datetime.now().isoformat(),
             "title": f"Audio Recording {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         }
 
-        response = supabase_client.table(SUPABASE_TABLE_NAME).insert(data).execute()
+        print(f"Données à insérer dans la base de données: {json.dumps(data, indent=2)}")
 
-        if response.error:
-            print(f"Erreur lors de l'enregistrement dans la base de données: {response.error}")
+        try:
+            response = supabase_client.table(SUPABASE_TABLE_NAME).insert(data).execute()
+            
+            if response.data:
+                print("Transcription enregistrée avec succès dans la base de données.")
+                print(f"URL de l'audio: {audio_url['signedURL']}")
+                return True
+            else:
+                print(f"Erreur lors de l'enregistrement dans la base de données: Pas de données retournées")
+                return False
+
+        except Exception as db_error:
+            print(f"Erreur lors de l'insertion dans la base de données: {db_error}")
+            print(f"Stacktrace complet: {traceback.format_exc()}")
             return False
-        else:
-            print("Transcription enregistrée avec succès dans la base de données.")
-            print(f"URL de l'audio: {audio_url}")
-            return True
 
     except Exception as e:
-        print(f"Erreur lors de l'enregistrement dans la base de données: {e}")
+        print(f"Erreur lors du processus d'enregistrement: {e}")
+        print(f"Stacktrace complet: {traceback.format_exc()}")
         return False
-
+    
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
