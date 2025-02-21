@@ -113,7 +113,10 @@ async def print_messages_from_socket(socket: ClientConnection, websocket: WebSoc
 
 async def stop_recording(websocket: ClientConnection) -> None:
     print(">>>>> Ending the recording…")
-    await websocket.send(json.dumps({"type": "stop_recording"}))
+    try:
+        await websocket.send(json.dumps({"type": "stop_recording"}))
+    except Exception as e:
+        print(f"Error sending stop_recording to Gladia: {e}")
     await asyncio.sleep(0)
 
 ## Sample code
@@ -225,6 +228,7 @@ async def websocket_transcire(websocket: WebSocket):
     # Initialize audio interface outside the loop
     p = pyaudio.PyAudio()
     websocket_active = True  # Keep track of the WebSocket's state
+    should_stop_recording = False  # Flag to signal stopping
 
     try:
         await websocket.accept()
@@ -257,15 +261,44 @@ async def websocket_transcire(websocket: WebSocket):
                     send_audio_task = asyncio.create_task(send_audio(gladia_ws, audio_data))
                     print_messages_task = asyncio.create_task(print_messages_from_socket(gladia_ws, websocket, transcription_list))
 
+                    async def check_for_stop():
+                        nonlocal should_stop_recording
+                        try:
+                            while True:
+                                message = await websocket.receive_text()
+                                if message:
+                                    try:
+                                        data = json.loads(message)
+                                        if data.get('type') == 'stop':
+                                            print("Received stop signal from frontend")
+                                            should_stop_recording = True
+                                            await stop_recording(gladia_ws) # Signal Gladia to stop
+                                            return  # Exit the check_for_stop task
+                                    except json.JSONDecodeError:
+                                        print("Invalid JSON format received.")
+                                await asyncio.sleep(0.1) # Check periodically
+                        except WebSocketDisconnect:
+                            nonlocal websocket_active
+                            websocket_active = False
+                            print("Client disconnected while checking for stop signal")
+                        except Exception as e:
+                            print(f"Error in check_for_stop: {e}")
+
+                    stop_check_task = asyncio.create_task(check_for_stop())
+
                     try:
                         done, pending = await asyncio.wait(
-                            [send_audio_task, print_messages_task],
+                            [send_audio_task, print_messages_task, stop_check_task],
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                         for task in pending:
                             task.cancel()
                         await asyncio.gather(*pending, return_exceptions=True)
                         print("Tâches annulées.")
+
+                        if should_stop_recording:
+                            print("Exiting processing loop due to stop signal.")
+
                     except WebSocketDisconnect:
                         websocket_active = False
                         print("Client disconnected during audio processing")
@@ -329,7 +362,7 @@ async def websocket_transcire(websocket: WebSocket):
                     break # Exit the loop
 
             #Option pour ne pas boucler
-            break
+            # break #Removed break
 
     except WebSocketDisconnect:
         print("Client disconnected")
